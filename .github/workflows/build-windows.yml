@@ -1,0 +1,98 @@
+# Builds Axion for Windows (x64), uploads CI artifacts, and attaches installers to GitHub Releases.
+# Release tag is v{version} from src-tauri/tauri.conf.json — bump version there for a new release line.
+# In-app updates use the GitHub Releases API (no latest.json / signing secret required).
+
+name: Build Windows
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+concurrency:
+  group: build-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v5
+        with:
+          version: 9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate app icons
+        run: pnpm tauri icon src/assets/axion-logo.jpg -o src-tauri/icons
+
+      - name: Read app version
+        id: version
+        shell: pwsh
+        run: |
+          $v = (Get-Content src-tauri/tauri.conf.json | ConvertFrom-Json).version
+          "version=$v" >> $env:GITHUB_OUTPUT
+
+      - name: Build Tauri app
+        run: pnpm tauri build
+
+      - name: Stage release assets
+        shell: pwsh
+        run: |
+          $out = "release-assets"
+          $bundle = "src-tauri/target/release/bundle"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item "$bundle/msi/*.msi" $out -ErrorAction Stop
+          Copy-Item "$bundle/nsis/*.exe" $out -ErrorAction Stop
+          Get-ChildItem $out
+
+      - name: Publish installers to GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: Axion v${{ steps.version.outputs.version }}
+          body: |
+            Windows build for **v${{ steps.version.outputs.version }}** (`${{ github.sha }}`).
+
+            Install **MSI** or **NSIS (.exe)** from the assets below. Axion checks this release for in-app updates automatically.
+          files: release-assets/*
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          overwrite_files: true
+          fail_on_unmatched_files: true
+
+      - name: Upload installer artifacts
+        uses: actions/upload-artifact@v5
+        with:
+          name: axion-windows-${{ github.sha }}
+          if-no-files-found: error
+          path: |
+            src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/bundle/nsis/*.exe

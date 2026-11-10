@@ -1,0 +1,174 @@
+# Debian-family .deb + AppImage (Ubuntu 22.04), plus AppImage/binary on Arch (container).
+# Arch / Manjaro users can also build locally (see README).
+
+name: Build Linux
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+concurrency:
+  group: build-linux-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-debian:
+    name: Debian / Ubuntu bundles
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libssl-dev
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v5
+        with:
+          version: 9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate app icons
+        run: pnpm tauri icon src/assets/axion-logo.jpg -o src-tauri/icons
+
+      - name: Build Tauri app
+        run: pnpm tauri build
+
+      - name: Upload bundle artifacts
+        uses: actions/upload-artifact@v5
+        with:
+          name: linux-debian-${{ github.sha }}
+          if-no-files-found: error
+          path: |
+            src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/appimage/*.AppImage
+
+  build-arch:
+    name: Arch bundles
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    outputs:
+      artifact_uploaded: ${{ steps.upload_artifacts.outcome == 'success' }}
+    container:
+      image: archlinux/archlinux:latest
+      options: --privileged
+
+    steps:
+      - name: Install system packages
+        run: |
+          pacman -Syu --noconfirm \
+            base-devel git curl openssl \
+            webkit2gtk-4.1 gtk3 libappindicator-gtk3 librsvg patchelf \
+            nodejs npm
+
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup pnpm
+        run: npm install -g pnpm@9
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate app icons
+        run: pnpm tauri icon src/assets/axion-logo.jpg -o src-tauri/icons
+
+      - name: Build Tauri app (AppImage only)
+        run: pnpm tauri build --bundles appimage
+
+      - name: Stage binary fallback
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin=src-tauri/target/release/axion
+          if [ -f "$bin" ]; then
+            tar -czf axion-linux-x86_64-gnu.tar.gz -C src-tauri/target/release axion
+          fi
+
+      - name: Upload bundle artifacts
+        id: upload_artifacts
+        uses: actions/upload-artifact@v5
+        with:
+          name: linux-arch-${{ github.sha }}
+          if-no-files-found: error
+          path: |
+            src-tauri/target/release/bundle/appimage/*.AppImage
+            axion-linux-x86_64-gnu.tar.gz
+
+  publish-release:
+    name: Publish Linux assets
+    needs: [build-debian, build-arch]
+    if: ${{ always() && needs.build-debian.result == 'success' }}
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Download Debian artifacts
+        uses: actions/download-artifact@v6
+        with:
+          name: linux-debian-${{ github.sha }}
+          path: release-assets-linux
+
+      - name: Download Arch artifacts
+        if: needs.build-arch.outputs.artifact_uploaded == 'true'
+        uses: actions/download-artifact@v6
+        with:
+          name: linux-arch-${{ github.sha }}
+          path: release-assets-linux
+
+      - name: Read app version
+        id: version
+        shell: bash
+        run: |
+          v=$(jq -r .version src-tauri/tauri.conf.json)
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: List staged assets
+        run: ls -la release-assets-linux || true
+
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: Axion v${{ steps.version.outputs.version }}
+          files: release-assets-linux/**
+          draft: false
+          prerelease: false
+          overwrite_files: true
+          fail_on_unmatched_files: true
